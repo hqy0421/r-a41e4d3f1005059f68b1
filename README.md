@@ -93,6 +93,31 @@ import file:
 
 ![](https://media.charlesleifer.com/blog/photos/sqlite-web-import.png)
 
+### Structured JSON documents
+
+Checking **Structured JSON documents** on the import tab stores nested JSON
+(arbitrary objects, arrays, empty containers and scalars) as ordinary rows that
+can be browsed and edited from the Content, Insert and Update tabs or the SQL
+console. The layout is:
+
+* the target table holds one row per document and supplies the document order;
+* `<table>_json_nodes` holds one row per JSON value with `parent_id`,
+  `member_name`, `ordinal`, `kind` and `value` columns;
+* `<table>_json_meta` records the top-level shape and the document key.
+
+The representation distinguishes a missing member (no row) from an explicit
+`null`, an empty array, an empty object, booleans, strings and numbers. Numbers
+are stored as the exact literal from the import file, so large integers and
+high-precision decimals are never rounded. The companion tables are shown under
+"Toggle helper tables" in the sidebar.
+
+Exporting a document table with **Rebuild structured JSON** regenerates JSON
+from the current rows, so changes made after the import are included. The
+export fails with an error, rather than dropping data, when the node graph has
+a dangling parent, a cycle, duplicate member names within an object, invalid
+array ordinals or an invalid document key. Imports are transactional: a failed
+import leaves the target table and any helper tables exactly as they were.
+
 The `export` tab supports exporting all, or a subset, of columns:
 
 ![](https://media.charlesleifer.com/blog/photos/sqlite-web-export.png)

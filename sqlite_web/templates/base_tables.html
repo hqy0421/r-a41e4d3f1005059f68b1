@@ -5,8 +5,9 @@
   <ul class="nav flex-column nav-pills" role="tablist">
     {% set virtual_tables = dataset.cached_virtual_tables() %}
     {% set virtual_tables_corollary = dataset.cached_corollary_virtual_tables() %}
+    {% set json_helper_tables = dataset.cached_json_helper_tables() %}
     {% for table_name in dataset.cached_tables()|sort %}
-      {% if table_name not in virtual_tables_corollary %}
+      {% if table_name not in virtual_tables_corollary and table_name not in json_helper_tables %}
       <li class="nav-item table-link">
         <a class="nav-link{% if table and table_name == table %} active{% endif %}" href="{{ url_for('table_structure', table=table_name) }}" title="{{ table_name }}">
           {{ table_name|truncate(24, True, leeway=2) }}
@@ -20,8 +21,15 @@
   </ul>
   <hr />
   <p><a href="#" id="toggle-helper-tables">Toggle helper tables</a></p>
-  <ul class="nav nav-pills flex-column" id="helper-tables" role="tablist"{% if table not in virtual_tables_corollary %} style="display:none;"{% endif %}>
+  <ul class="nav nav-pills flex-column" id="helper-tables" role="tablist"{% if table not in virtual_tables_corollary and table not in json_helper_tables %} style="display:none;"{% endif %}>
     {% for table_name in virtual_tables_corollary|sort %}
+      <li{% if table and table_name == table %} class="active"{% endif %}>
+        <a href="{{ url_for('table_structure', table=table_name) }}" title="{{ table_name }}">
+          <small>{{ table_name|truncate(24, True, leeway=2) }}</small>
+        </a>
+      </li>
+    {% endfor %}
+    {% for table_name in json_helper_tables|sort %}
       <li{% if table and table_name == table %} class="active"{% endif %}>
         <a href="{{ url_for('table_structure', table=table_name) }}" title="{{ table_name }}">
           <small>{{ table_name|truncate(24, True, leeway=2) }}</small>

@@ -92,6 +92,18 @@ App = window.App || {};
             });
         });
 
+        /* A structured JSON import/export ignores the flat options. */
+        function syncStructureForm() {
+            var structured = $('input#id_structure').is(':checked');
+            $('div#strict-group').toggle(!structured);
+            var exportStructured = $('input#id_structured').is(':checked');
+            $('div#export-columns-group, div#export-format-group').toggle(
+                !exportStructured);
+        }
+        $('input#id_structure').on('change', syncStructureForm);
+        $('input#id_structured').on('change', syncStructureForm);
+        syncStructureForm();
+
         /* Checkboxes for enabling/disabling inputs. */
         $('input.chk-enable-column').on('click', function (evt) {
             var elem = $(this),

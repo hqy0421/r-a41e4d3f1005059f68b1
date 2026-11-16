@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import shutil
 import sqlite3
@@ -8,6 +10,9 @@ from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
 from sqlite_web import sqlite_web as sw
+from sqlite_web.json_documents import JsonDocumentError
+from sqlite_web.json_documents import export_documents
+from sqlite_web.json_documents import import_documents
 from sqlite_web.executor import Result
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
@@ -972,6 +977,383 @@ class TestContentTab(BaseAppTestCase):
                             follow_redirects=True)
         self.assertIn(b'alert-dismissible', r.data)
         self.assertNotIn(b'alert-dismissable', r.data)
+
+
+class TestJsonDocuments(BaseAppTestCase):
+    """Reversible relational storage of nested JSON documents."""
+
+    def create_docs_table(self, name='docs'):
+        return self.client.post('/create-table/', data={
+            'table_name': name, 'redirect': '/'})
+
+    def import_json(self, payload, table='docs', structure=True,
+                    filename='doc.json', follow_redirects=True, client=None):
+        if not isinstance(payload, bytes):
+            payload = payload.encode('utf8')
+        data = {'file': (io.BytesIO(payload), filename)}
+        if structure:
+            data['structure'] = '1'
+        return (client or self.client).post(
+            '/%s/import/' % table, data=data,
+            content_type='multipart/form-data',
+            follow_redirects=follow_redirects)
+
+    def export_json(self, table='docs', structured=True):
+        data = {}
+        if structured:
+            data['structured'] = '1'
+        return self.client.post('/%s/export/' % table, data=data)
+
+    def node_rows(self, table='docs'):
+        return self.dbrows(
+            'SELECT "id", "document_id", "parent_id", "member_name", '
+            '"ordinal", "kind", "value" FROM "%s_json_nodes" ORDER BY "id"'
+            % table)
+
+    def dbexec(self, sql, *params):
+        # Raw connection: sqlite3 leaves foreign_keys off, so tests can
+        # create the corrupt structures the exporter must reject.
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute('PRAGMA foreign_keys=OFF')
+            conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def setUp(self):
+        super(TestJsonDocuments, self).setUp()
+        self.create_docs_table()
+
+    def assertRoundTrip(self, payload, expected=None):
+        if isinstance(payload, str):
+            source = payload
+        else:
+            source = json.dumps(payload)
+        r = self.import_json(source)
+        self.assertIn(b'Successfully imported', r.data)
+        r = self.export_json()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers['Content-Type'], 'application/json')
+        if expected is None:
+            expected = source
+        self.assertEqual(json.loads(r.data.decode('utf8')),
+                         json.loads(expected))
+        return r
+
+    def test_round_trip_preserves_structure(self):
+        payload = [
+            {'name': 'widget', 'tags': ['a', 'b'], 'dims': {'w': 2, 'h': 3},
+             'missing': None, 'empty_list': [], 'empty_obj': {},
+             'flags': [True, False, 'true', '', 0, 1]},
+            {'another': {'deep': [{'x': []}]}},
+        ]
+        r = self.assertRoundTrip(payload)
+        # And the rebuilt text is re-importable into a fresh table.
+        self.create_docs_table('docs2')
+        self.import_json(r.data, table='docs2')
+        self.assertEqual(json.loads(self.export_json('docs2').data), payload)
+
+    def test_scalar_root_document(self):
+        r = self.import_json('"just a string"', follow_redirects=False)
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(self.export_json().data, b'"just a string"')
+
+    def test_missing_vs_null_vs_empty(self):
+        self.import_json('[{"a": null, "b": [], "c": {}}]')
+        out = json.loads(self.export_json().data)
+        self.assertEqual(out, [{'a': None, 'b': [], 'c': {}}])
+        # The distinctions live in the rows: null is its own kind, empty
+        # containers are container rows without children, "a" has a row.
+        kinds = {row[3]: row[5] for row in self.node_rows() if row[3]}
+        self.assertEqual(kinds, {'a': 'null', 'b': 'array', 'c': 'object'})
+
+    def test_types_do_not_collide(self):
+        payload = [{'b': True, 's': 'true', 'n': 1, 'z': '1',
+                    'f': False, 'fs': 'false'}]
+        self.import_json(json.dumps(payload))
+        out = json.loads(self.export_json().data)
+        self.assertEqual(out, payload)
+        self.assertIs(out[0]['b'], True)
+        self.assertIsInstance(out[0]['s'], str)
+        self.assertEqual(out[0]['s'], 'true')
+        self.assertIs(out[0]['f'], False)
+        self.assertEqual(out[0]['n'], 1)
+
+    def test_large_integers_and_decimals_are_not_rounded(self):
+        source = ('[{"big": 123456789012345678901234567890, '
+                  '"dec": 0.10000000000000000000000001, '
+                  '"exp": 1E+2, "zero": -0, "trail": 1.20}]')
+        self.import_json(source)
+        out = self.export_json().data.decode('utf8')
+        for literal in ('123456789012345678901234567890',
+                        '0.10000000000000000000000001', '1E+2', '-0', '1.20'):
+            self.assertIn(literal, out)
+
+    def test_member_order_and_array_order_round_trip(self):
+        source = '[{"z": 1, "a": 2, "m": [3, 1, 2]}]'
+        self.import_json(source)
+        self.assertEqual(self.export_json().data.decode('utf8').replace(
+            '\n', '').replace(' ', ''), '[{"z":1,"a":2,"m":[3,1,2]}]')
+
+    def test_edits_through_sql_are_reflected(self):
+        self.import_json('[{"count": 1, "label": "old"}]')
+        rows = self.node_rows()
+        number_id = [r[0] for r in rows if r[5] == 'number'][0]
+        string_id = [r[0] for r in rows if r[5] == 'string'][0]
+        self.client.post('/query/', data={'sql': (
+            "UPDATE docs_json_nodes SET value = '99' WHERE id = %s;"
+            % number_id)})
+        self.client.post('/query/', data={'sql': (
+            "UPDATE docs_json_nodes SET value = 'new' WHERE id = %s;"
+            % string_id)})
+        self.assertEqual(json.loads(self.export_json().data),
+                         [{'count': 99, 'label': 'new'}])
+
+    def test_edits_through_update_form_are_reflected(self):
+        self.import_json('[{"label": "old"}]')
+        string_id = [r[0] for r in self.node_rows() if r[5] == 'string'][0]
+        r = self.client.post('/docs_json_nodes/update/%s/' % key_encode(
+            [string_id]), data={'chk_value': 'on', 'value': 'via-form'},
+            follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(self.export_json().data),
+                         [{'label': 'via-form'}])
+
+    def test_new_rows_through_insert_form_are_reflected(self):
+        self.import_json('[{"a": 1}]')
+        root_id = self.node_rows()[0][0]
+        r = self.client.post('/docs_json_nodes/insert/', data={
+            'document_id': '1', 'parent_id': str(root_id),
+            'chk_member_name': 'on', 'member_name': 'added',
+            'chk_kind': 'on', 'kind': 'string',
+            'chk_value': 'on', 'value': 'yes'}, follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(json.loads(self.export_json().data),
+                         [{'a': 1, 'added': 'yes'}])
+
+    def test_bulk_delete_cascades_to_nodes(self):
+        self.import_json('[{"a": 1}, {"b": 2}]')
+        r = self.client.post('/docs/content/', data={
+            'action': 'bulk-delete', 'pk': key_encode([1])},
+            follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.dbrows('SELECT "id" FROM docs ORDER BY "id"'),
+                         [(2,)])
+        self.assertEqual(json.loads(self.export_json().data), [{'b': 2}])
+
+    def test_dangling_parent_rejected(self):
+        self.import_json('[{"a": [1]}]')
+        self.dbexec(
+            'UPDATE docs_json_nodes SET parent_id = 999 WHERE kind = ?',
+            'number')
+        r = self.export_json()
+        self.assertIn(b'dangling parent_id', r.data)
+        self.assertNotIn(b'Content-Disposition', r.headers)
+
+    def test_cycle_rejected(self):
+        self.import_json('[{"a": {"b": [1]}}]')
+        array_id = [r[0] for r in self.node_rows() if r[5] == 'array'][0]
+        object_id = [r[0] for r in self.node_rows() if r[5] == 'object'
+                     and r[2] is not None][0]
+        self.dbexec(
+            'UPDATE docs_json_nodes SET parent_id = ? WHERE id = ?',
+            array_id, object_id)
+        r = self.export_json()
+        self.assertIn(b'Cycle detected', r.data)
+
+    def test_duplicate_member_name_rejected(self):
+        self.import_json('[{"a": 1, "b": 2}]')
+        self.dbexec(
+            'UPDATE docs_json_nodes SET member_name = ? WHERE member_name = ?',
+            'a', 'b')
+        r = self.export_json()
+        self.assertIn(b'Duplicate member name', r.data)
+
+    def test_invalid_ordinals_rejected(self):
+        cases = [
+            ('ordinal gap', 'UPDATE docs_json_nodes SET ordinal = 2 '
+                            'WHERE ordinal = 1'),
+            ('ordinal duplicate', 'UPDATE docs_json_nodes SET ordinal = 0 '
+                                  'WHERE ordinal = 1'),
+            ('negative ordinal', 'UPDATE docs_json_nodes SET ordinal = -1 '
+                                 'WHERE ordinal = 0'),
+        ]
+        for label, sql in cases:
+            self.tearDown()
+            self.setUp()
+            self.import_json('[{"a": [10, 20]}]')
+            self.dbexec(sql)
+            r = self.export_json()
+            self.assertIn(b'invalid ordinals', r.data, label)
+
+    def test_malformed_input_rolls_back_whole_batch(self):
+        r = self.import_json('[{"a": 1}, {"b": 2},',
+                             follow_redirects=True)
+        self.assertIn(b'Invalid JSON', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM docs'), [(0,)])
+        self.assertEqual(
+            self.dbrows("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE "
+                        "'docs_json_%'"), [(0,)])
+
+    def test_failed_import_does_not_overwrite_existing_tables(self):
+        # A pre-existing unrelated table called docs_json_nodes must not be
+        # clobbered by a structured import.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('CREATE TABLE docs_json_nodes (id INTEGER PRIMARY KEY, '
+                     'kept TEXT)')
+        conn.execute("INSERT INTO docs_json_nodes (kept) VALUES ('keep-me')")
+        conn.commit()
+        conn.close()
+        r = self.import_json('[{"a": 1}]', follow_redirects=True)
+        self.assertIn(b'refusing to overwrite', r.data)
+        self.assertEqual(self.dbrows(
+            'SELECT kept FROM docs_json_nodes'), [('keep-me',)])
+        self.assertEqual(self.dbrows(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'docs_json_meta'"),
+            [(0,)])
+
+    def test_import_aborted_midway_rolls_back_and_keeps_old_tables(self):
+        # The trigger aborts the document insert, so neither the document
+        # rows nor the freshly created helper tables may survive.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("CREATE TRIGGER no_docs BEFORE INSERT ON docs "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+        conn.commit()
+        conn.close()
+        r = self.import_json('[{"a": 1}]', follow_redirects=True)
+        self.assertIn(b'Error importing JSON documents', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM docs'), [(0,)])
+        self.assertEqual(self.dbrows(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'docs_json_%'"),
+            [(0,)])
+
+    def test_existing_rows_block_first_import(self):
+        self.dbexec('INSERT INTO docs (id) VALUES (7)')
+        r = self.import_json('[{"a": 1}]', follow_redirects=True)
+        self.assertIn(b'already contains', r.data)
+        self.assertEqual(self.dbrows('SELECT id FROM docs'), [(7,)])
+
+    def test_ordinary_flat_import_still_works(self):
+        r = self.import_json('[{"name": "a"}, {"name": "b"}]',
+                             table='users', structure=False,
+                             filename='users.json', follow_redirects=True)
+        self.assertIn(b'Successfully imported 2 objects', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM users'), [(5,)])
+
+    def test_flat_import_into_document_table_refused(self):
+        self.import_json('[{"a": 1}]')
+        r = self.import_json('[{"name": "x"}]', structure=False,
+                             follow_redirects=True)
+        self.assertIn(b'structured JSON documents', r.data)
+        self.assertEqual(json.loads(self.export_json().data), [{'a': 1}])
+
+    def test_ordinary_column_export_on_document_table(self):
+        self.import_json('[{"a": 1}]')
+        r = self.client.post('/docs/export/', data={
+            'columns': 'id', 'export_format': 'json'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers['Content-Disposition'],
+                         'attachment; filename="docs-export.json"')
+        self.assertEqual(json.loads(r.data), [{'id': 1}])
+
+    def test_helper_tables_hidden_from_sidebar(self):
+        self.import_json('[{"a": 1}]')
+        body = self.client.get('/docs/content/').data.decode('utf8')
+        main_nav, helpers = body.split('<hr />', 1)
+        self.assertNotIn('docs_json_nodes', main_nav)
+        self.assertNotIn('docs_json_meta', main_nav)
+        self.assertIn('docs_json_nodes', helpers)
+        self.assertIn('docs_json_meta', helpers)
+
+    def test_helper_tables_are_browsable_and_editable(self):
+        self.import_json('[{"a": 1}]')
+        for name in ('docs_json_nodes', 'docs_json_meta'):
+            r = self.client.get('/%s/content/' % name)
+            self.assertEqual(r.status_code, 200, name)
+
+    def test_drop_document_table_drops_helpers(self):
+        self.import_json('[{"a": 1}]')
+        r = self.client.post('/docs/drop/', follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.dbrows(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'docs_json_%'"),
+            [])
+
+    def test_single_document_and_list_modes(self):
+        r = self.import_json('{"one": [1, 2]}', follow_redirects=False)
+        self.assertIn(r.status_code, (302, 303))
+        self.assertEqual(json.loads(self.export_json().data),
+                         {'one': [1, 2]})
+        # A second single document cannot be appended.
+        r = self.import_json('{"two": 2}', follow_redirects=True)
+        self.assertIn(b'already stores a single JSON document', r.data)
+        # A list is a different root mode and cannot be mixed in.
+        r = self.import_json('[{"three": 3}]', follow_redirects=True)
+        self.assertIn(b'cannot append', r.data)
+
+    def test_duplicate_member_in_input_rejected(self):
+        r = self.import_json('[{"a": 1, "a": 2}]', follow_redirects=True)
+        self.assertIn(b'Duplicate object member name', r.data)
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM docs'), [(0,)])
+
+    def test_import_requires_integer_primary_key(self):
+        r = self.import_json('[{"a": 1}]', table='comp',
+                             follow_redirects=True)
+        self.assertIn(b'single-column primary key', r.data)
+        r = self.import_json('[{"a": 1}]', table='tag',
+                             follow_redirects=True)
+        self.assertIn(b'INTEGER affinity', r.data)
+
+
+class TestJsonDocumentModule(BaseAppTestCase):
+    """Direct tests of the module API, without the HTTP layer."""
+
+    def dataset(self):
+        return sw.datasets[list(sw.datasets)[0]]
+
+    def test_import_export_round_trip(self):
+        self.client.post('/create-table/', data={'table_name': 'docs'})
+        dataset = self.dataset()
+        n_docs, n_nodes = import_documents(
+            dataset, 'docs', io.StringIO('[{"a": [1, {"b": null}]}]'))
+        self.assertEqual((n_docs, n_nodes), (1, 5))
+        self.assertEqual(
+            export_documents(dataset, 'docs', indent=None),
+            '[{"a": [1, {"b": null}]}]')
+
+    def test_export_of_plain_table_rejected(self):
+        with self.assertRaises(JsonDocumentError):
+            export_documents(self.dataset(), 'users')
+
+    def test_import_rejects_unknown_table(self):
+        with self.assertRaises(JsonDocumentError):
+            import_documents(self.dataset(), 'nope', io.StringIO('[]'))
+
+    def test_import_rejects_nan_and_infinity(self):
+        self.client.post('/create-table/', data={'table_name': 'docs'})
+        for token in ('NaN', 'Infinity', '-Infinity'):
+            with self.assertRaises(JsonDocumentError):
+                import_documents(
+                    self.dataset(), 'docs',
+                    io.StringIO('[{"a": %s}]' % token))
+
+    def test_import_is_all_or_nothing_on_node_failure(self):
+        # A trigger on the target table aborts the document insert after the
+        # helper tables have been created inside the same transaction.
+        self.client.post('/create-table/', data={'table_name': 'docs'})
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("CREATE TRIGGER block_docs BEFORE INSERT ON docs "
+                     "BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(Exception):
+            import_documents(self.dataset(), 'docs',
+                             io.StringIO('[{"a": 1}]'))
+        self.assertEqual(
+            self.dbrows("SELECT name FROM sqlite_master WHERE name LIKE "
+                        "'docs_json_%'"), [])
+        self.assertEqual(self.dbrows('SELECT COUNT(*) FROM docs'), [(0,)])
 
 
 class TestUrlPrefix(BaseAppTestCase):

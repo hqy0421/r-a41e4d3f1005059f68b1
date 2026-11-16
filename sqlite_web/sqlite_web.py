@@ -85,6 +85,15 @@ except ImportError:
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
 
+try:
+    from sqlite_web.json_documents import (
+        JsonDocumentError, export_documents, import_documents,
+        is_document_table)
+except ImportError:
+    from json_documents import (
+        JsonDocumentError, export_documents, import_documents,
+        is_document_table)
+
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
 DEBUG = False
@@ -176,6 +185,26 @@ class SqliteDataSet(DataSet):
             return n == sum(1 for c in self.get_columns(table)
                             if c.primary_key)
         return self._cached(('usable_pk', table), check)
+
+    def cached_is_document_table(self, table):
+        return self._cached(('document_table', table),
+                            lambda: is_document_table(self, table))
+
+    def cached_json_helper_tables(self):
+        # The tables backing a structured JSON import are ordinary tables,
+        # but they are an implementation detail of their document table.
+        def build():
+            tables = set(self.cached_tables())
+            helpers = set()
+            for suffix in ('_json_nodes', '_json_meta'):
+                for name in tables:
+                    if not name.endswith(suffix):
+                        continue
+                    base = name[:-len(suffix)]
+                    if base in tables and self.cached_is_document_table(base):
+                        helpers.add(name)
+            return helpers
+        return self._cached('json_helper_tables', build)
 
     @property
     def filename(self):
@@ -1322,15 +1351,14 @@ def export(query, export_format, table=None):
     if table:
         filename = '%s-%s' % (table, filename)
 
-    # Avoid any special chars in export filename.
-    filename = re.sub(r'[^\w\d\-\.]+', '', filename)
-
     if peewee_version >= (4, 0, 2):
         kwargs['base64_bytes'] = app.config['BLOB_AS_BASE64']
 
     dataset.freeze(query, export_format, file_obj=buf, **kwargs)
+    return _export_response(buf.getvalue().encode('utf8'), filename, mimetype)
 
-    response_data = buf.getvalue().encode('utf8')
+def _export_response(response_data, filename, mimetype):
+    filename = re.sub(r'[^\w\d\-\.]+', '', filename)
     response = make_response(response_data)
     response.headers['Content-Length'] = len(response_data)
     response.headers['Content-Type'] = mimetype
@@ -1345,26 +1373,41 @@ def export(query, export_format, table=None):
 def table_export(table):
     dataset = get_dataset()
     columns = dataset.get_columns(table)
+    is_document = dataset.cached_is_document_table(table)
     if request.method == 'POST':
         export_format = request.form.get('export_format') or 'json'
-        col_dict = {c.name: c for c in columns}
-        selected = [c for c in (request.form.getlist('columns') or [])
-                    if c in col_dict]
-        if not selected:
-            flash('Please select one or more columns to export.', 'danger')
-        else:
-            model = dataset[table].model_class
-            fields = [model._meta.columns[c] for c in selected]
-            query = model.select(*fields).dicts()
+        if is_document and request.form.get('structured'):
             try:
-                return export(query, export_format, table)
+                data = export_documents(dataset, table)
+            except JsonDocumentError as exc:
+                flash('Cannot export structured JSON: %s' % exc, 'danger')
             except Exception as exc:
-                flash('Error generating export: %s' % exc, 'danger')
-                app.logger.exception('Error generating export.')
+                flash('Error rebuilding JSON documents: %s' % exc, 'danger')
+                app.logger.exception('Error rebuilding JSON documents.')
+            else:
+                return _export_response(
+                    data.encode('utf8'), '%s.json' % table,
+                    'application/json')
+        else:
+            col_dict = {c.name: c for c in columns}
+            selected = [c for c in (request.form.getlist('columns') or [])
+                        if c in col_dict]
+            if not selected:
+                flash('Please select one or more columns to export.', 'danger')
+            else:
+                model = dataset[table].model_class
+                fields = [model._meta.columns[c] for c in selected]
+                query = model.select(*fields).dicts()
+                try:
+                    return export(query, export_format, table)
+                except Exception as exc:
+                    flash('Error generating export: %s' % exc, 'danger')
+                    app.logger.exception('Error generating export.')
 
     return render_template(
         'table_export.html',
         columns=columns,
+        is_document=is_document,
         table=table)
 
 @app.route('/download/')
@@ -1417,6 +1460,8 @@ def table_import(table):
     count = None
     request_data = get_request_data()
     strict = bool(request_data.get('strict'))
+    structure = bool(request_data.get('structure'))
+    is_document = dataset.cached_is_document_table(table)
 
     if request.method == 'POST':
         file_obj = request.files.get('file')
@@ -1425,6 +1470,15 @@ def table_import(table):
         elif not file_obj.filename.lower().endswith(('.csv', '.json')):
             flash('Unsupported file-type. Must be a .json or .csv file.',
                   'danger')
+        elif structure and not file_obj.filename.lower().endswith('.json'):
+            flash('Structured import requires a .json file.', 'danger')
+        elif structure and dataset.is_readonly:
+            flash('Cannot import into a read-only database.', 'danger')
+        elif is_document and not structure:
+            # A flat import would add document rows with no structure, which
+            # the structured exporter could never rebuild.
+            flash('This table stores structured JSON documents; use the '
+                  'structured JSON import.', 'danger')
         else:
             if file_obj.filename.lower().endswith('.json'):
                 format = 'json'
@@ -1445,30 +1499,49 @@ def table_import(table):
                 # Fixed in werkzeug 0.15.
                 stream = StringIO(file_obj.read().decode('utf8'))
 
-            kwargs = {}
-            if peewee_version >= (4, 0, 2):
-                kwargs['base64_bytes'] = app.config['BLOB_AS_BASE64']
-            try:
-                with dataset.transaction():
-                    count = dataset.thaw(
-                        table,
-                        format=format,
-                        file_obj=stream,
-                        strict=strict,
-                        **kwargs)
-            except Exception as exc:
-                flash('Error importing file: %s' % exc, 'danger')
-                app.logger.exception('Error importing file.')
+            if structure:
+                try:
+                    documents, nodes = import_documents(
+                        dataset, table, stream)
+                except JsonDocumentError as exc:
+                    flash('Error importing JSON documents: %s' % exc, 'danger')
+                except Exception as exc:
+                    flash('Error importing JSON documents: %s' % exc, 'danger')
+                    app.logger.exception('Error importing JSON documents.')
+                else:
+                    flash(
+                        'Successfully imported %s JSON document(s) (%s '
+                        'structural row(s)) from %s.' % (
+                            documents, nodes, file_obj.filename),
+                        'success')
+                    return redirect(url_for('table_content', table=table))
             else:
-                flash(
-                    'Successfully imported %s objects from %s.' % (
-                        count, file_obj.filename),
-                    'success')
-                return redirect(url_for('table_content', table=table))
+                kwargs = {}
+                if peewee_version >= (4, 0, 2):
+                    kwargs['base64_bytes'] = app.config['BLOB_AS_BASE64']
+                try:
+                    with dataset.transaction():
+                        count = dataset.thaw(
+                            table,
+                            format=format,
+                            file_obj=stream,
+                            strict=strict,
+                            **kwargs)
+                except Exception as exc:
+                    flash('Error importing file: %s' % exc, 'danger')
+                    app.logger.exception('Error importing file.')
+                else:
+                    flash(
+                        'Successfully imported %s objects from %s.' % (
+                            count, file_obj.filename),
+                        'success')
+                    return redirect(url_for('table_content', table=table))
 
     return render_template(
         'table_import.html',
         count=count,
+        is_document=is_document,
+        structure=structure,
         strict=strict,
         table=table)
 
@@ -1483,8 +1556,22 @@ def drop_table(table):
             if is_view:
                 dataset.query('DROP VIEW %s;' % quote_ident(table))
             else:
+                document = dataset.cached_is_document_table(table)
                 model_class = dataset[table].model_class
-                model_class.drop_table()
+                if document:
+                    # The node and metadata tables are an implementation
+                    # detail of the document table, so they go together.
+                    # Dropping the node table first keeps no foreign key
+                    # pointing at a table that is about to disappear.
+                    with dataset.transaction():
+                        for helper in ('_json_nodes', '_json_meta'):
+                            name = table + helper
+                            if name in dataset.tables:
+                                dataset.query(
+                                    'DROP TABLE %s' % quote_ident(name))
+                        model_class.drop_table()
+                else:
+                    model_class.drop_table()
         except Exception as exc:
             flash('Error attempting to drop %s "%s".' % (label, table), 'danger')
             app.logger.exception('Error attempting to drop %s "%s".', label, table)
